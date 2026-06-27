@@ -1,0 +1,842 @@
+From 6db9bbc9c90bd1ec89ec0d1e4b1118c8a58c5276 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 27 Jun 2026 04:39:57 +0000
+Subject: [PATCH] Add syscall tracer and unify boot VFS with linux_compat path
+
+- Hook INT 0x80 dispatch_syscall with serial syscall tracing (pid, args,
+  return/errno, fd-table dump on fd-related failures)
+- Call vfs::init() at boot before legacy fs::init(); mount /proc and /dev
+  on the syscall-facing VFS (null, zero, urandom, console, tty)
+- Route read/write through special_fd for pipes, eventfd, sockets
+- Extend ramfs directories to hold arbitrary InodeOps (device nodes)
+---
+ src/boot_ui.rs               |  27 +++-
+ src/debug/mod.rs             |   5 +
+ src/debug/syscall_trace.rs   | 292 +++++++++++++++++++++++++++++++++++
+ src/linux_compat/file_ops.rs |   8 +
+ src/main.rs                  |   1 +
+ src/syscall_handler.rs       |   6 +-
+ src/vfs/devfs.rs             | 190 +++++++++++++++++++++++
+ src/vfs/file_descriptor.rs   |   8 +
+ src/vfs/mod.rs               |  15 +-
+ src/vfs/ramfs.rs             |  61 ++++----
+ 10 files changed, 572 insertions(+), 41 deletions(-)
+ create mode 100644 src/debug/mod.rs
+ create mode 100644 src/debug/syscall_trace.rs
+ create mode 100644 src/vfs/devfs.rs
+
+diff --git a/src/boot_ui.rs b/src/boot_ui.rs
+index 1c34be6..a5bdf38 100644
+--- a/src/boot_ui.rs
++++ b/src/boot_ui.rs
+@@ -1168,25 +1168,36 @@ pub fn filesystem_mount_progress() -> FilesystemMountResult {
+ 
+     let mut result = FilesystemMountResult::new();
+ 
+-    // Initialize VFS and mount root filesystem
+-    update_substage(1, "Initializing virtual file system...");
+-    match crate::fs::init() {
++    // Initialize VFS used by the live syscall path (linux_compat → src/vfs).
++    update_substage(1, "Initializing syscall VFS...");
++    match crate::vfs::init() {
+         Ok(()) => {
+-            report_success("VFS root filesystem mounted");
++            report_success("Syscall VFS initialized (/proc, /dev, ramfs root)");
+             result.vfs_ready = true;
+             result.root_mounted = true;
+         }
++        Err(e) => {
++            let reason = format!("{:?}", e);
++            report_warning("Syscall VFS", &reason);
++        }
++    }
++
++    // Legacy desktop VFS (src/fs) — not used by linux_compat syscalls.
++    update_substage(2, "Initializing legacy file system...");
++    match crate::fs::init() {
++        Ok(()) => {
++            report_success("Legacy VFS mounted (desktop path only)");
++        }
+         Err(e) => {
+             let reason = format!("{}", e);
+-            report_warning("VFS", &reason);
++            report_warning("Legacy VFS", &reason);
+         }
+     }
+ 
+-    update_substage(2, "Root file system status...");
+     if result.root_mounted {
+-        report_success("Root filesystem ready");
++        report_success("Root filesystem ready for syscalls");
+     } else {
+-        report_warning("Root filesystem", "Not mounted");
++        report_warning("Root filesystem", "Syscall VFS not mounted");
+     }
+ 
+     // Initialize initramfs
+diff --git a/src/debug/mod.rs b/src/debug/mod.rs
+new file mode 100644
+index 0000000..0ed2c68
+--- /dev/null
++++ b/src/debug/mod.rs
+@@ -0,0 +1,5 @@
++//! Kernel debugging and Linux compatibility instrumentation.
++
++pub mod syscall_trace;
++
++pub use syscall_trace::{is_enabled, set_enabled, trace_syscall};
+diff --git a/src/debug/syscall_trace.rs b/src/debug/syscall_trace.rs
+new file mode 100644
+index 0000000..a2d63b6
+--- /dev/null
++++ b/src/debug/syscall_trace.rs
+@@ -0,0 +1,292 @@
++//! Linux-style syscall tracing for compatibility bring-up.
++//!
++//! Logs syscall name, decoded arguments where practical, return values, and
++//! errno on failure. Enable at boot or via [`set_enabled`].
++
++extern crate alloc;
++
++use alloc::format;
++use alloc::string::String;
++use core::sync::atomic::{AtomicBool, Ordering};
++
++use crate::process;
++use crate::syscall::SyscallNumber;
++
++static ENABLED: AtomicBool = AtomicBool::new(true);
++
++/// Whether syscall tracing is enabled.
++pub fn is_enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// Enable or disable syscall tracing at runtime.
++pub fn set_enabled(enabled: bool) {
++    ENABLED.store(enabled, Ordering::Relaxed);
++}
++
++/// Trace one syscall invocation (no-op when disabled).
++pub fn trace_syscall(
++    num: u64,
++    arg1: u64,
++    arg2: u64,
++    arg3: u64,
++    arg4: u64,
++    arg5: u64,
++    arg6: u64,
++    result: i64,
++) {
++    if !is_enabled() {
++        return;
++    }
++
++    let pid = process::current_pid();
++    let tid = pid;
++    let name = syscall_name(SyscallNumber::from_u64(num));
++    let args = decode_args(SyscallNumber::from_u64(num), arg1, arg2, arg3, arg4, arg5, arg6);
++    let ret = format_result(SyscallNumber::from_u64(num), result);
++
++    crate::serial_println!(
++        "[pid={} tid={} exe=kernel]\nsyscall={}({})\n-> {}",
++        pid,
++        tid,
++        name,
++        args,
++        ret
++    );
++
++    if result < 0 && should_dump_fds(SyscallNumber::from_u64(num)) {
++        dump_open_fds();
++    }
++}
++
++fn should_dump_fds(syscall: SyscallNumber) -> bool {
++    matches!(
++        syscall,
++        SyscallNumber::Read
++            | SyscallNumber::Write
++            | SyscallNumber::Open
++            | SyscallNumber::Openat
++            | SyscallNumber::Close
++            | SyscallNumber::Fstat
++            | SyscallNumber::Poll
++            | SyscallNumber::EpollWait
++            | SyscallNumber::EpollPwait
++    )
++}
++
++fn dump_open_fds() {
++  let table = crate::vfs::get_vfs().open_fd_snapshot();
++  if table.is_empty() {
++      crate::serial_println!("  fd-table: (no tracked fds >= 3)");
++      return;
++  }
++  for (fd, kind) in table {
++      crate::serial_println!("  fd-table: fd={} kind={:?}", fd, kind);
++  }
++}
++
++fn format_result(syscall: SyscallNumber, result: i64) -> String {
++    if result >= 0 {
++        match syscall {
++            SyscallNumber::Open | SyscallNumber::Openat | SyscallNumber::Socket
++            | SyscallNumber::Pipe | SyscallNumber::Pipe2 | SyscallNumber::EpollCreate1
++            | SyscallNumber::Accept | SyscallNumber::Accept4 => {
++                return format!("fd={result}");
++            }
++            SyscallNumber::Mmap => return format!("addr=0x{result:x}"),
++            SyscallNumber::Clone | SyscallNumber::Fork => return format!("pid={result}"),
++            _ => {}
++        }
++        return format!("{result}");
++    }
++
++    let errno = (-result) as i32;
++    format!("-1 errno={errno} ({})", errno_name(errno))
++}
++
++fn errno_name(errno: i32) -> &'static str {
++    match errno {
++        1 => "EPERM",
++        2 => "ENOENT",
++        3 => "ESRCH",
++        4 => "EINTR",
++        5 => "EIO",
++        6 => "ENXIO",
++        9 => "EBADF",
++        11 => "EAGAIN",
++        12 => "ENOMEM",
++        13 => "EACCES",
++        14 => "EFAULT",
++        17 => "EEXIST",
++        19 => "ENODEV",
++        20 => "ENOTDIR",
++        21 => "EISDIR",
++        22 => "EINVAL",
++        28 => "ENOSPC",
++        38 => "ENOSYS",
++        95 => "EOPNOTSUPP",
++        _ => "ERR",
++    }
++}
++
++fn decode_args(
++    syscall: SyscallNumber,
++    a1: u64,
++    a2: u64,
++    a3: u64,
++    a4: u64,
++    a5: u64,
++    a6: u64,
++) -> String {
++    match syscall {
++        SyscallNumber::Read => format!("fd={}, buf=0x{:x}, count={}", a1 as i32, a2, a3),
++        SyscallNumber::Write => format!("fd={}, buf=0x{:x}, count={}", a1 as i32, a2, a3),
++        SyscallNumber::Open => format!(
++            "path={}, flags=0x{:x}, mode=0o{:o}",
++            cstr_preview(a1 as *const u8),
++            a2,
++            a3
++        ),
++        SyscallNumber::Openat => format!(
++            "dirfd={}, path={}, flags=0x{:x}, mode=0o{:o}",
++            a1 as i32,
++            cstr_preview(a2 as *const u8),
++            a3,
++            a4
++        ),
++        SyscallNumber::Close => format!("fd={}", a1 as i32),
++        SyscallNumber::Mmap => format!(
++            "addr=0x{:x}, len={}, prot=0x{:x}, flags=0x{:x}, fd={}, off={}",
++            a1, a2, a3, a4, a5 as i32, a6
++        ),
++        SyscallNumber::Brk => format!("addr=0x{:x}", a1),
++        SyscallNumber::Futex => format!(
++            "uaddr=0x{:x}, op={}, val={}, timeout=0x{:x}",
++            a1, a2, a3, a4
++        ),
++        SyscallNumber::EpollWait | SyscallNumber::EpollPwait => format!(
++            "epfd={}, maxevents={}, timeout={}",
++            a1 as i32, a3, a4 as i32
++        ),
++        SyscallNumber::Poll | SyscallNumber::Ppoll => {
++            format!("fds=0x{:x}, nfds={}, timeout=0x{:x}", a1, a2, a3)
++        }
++        SyscallNumber::Clone => format!("flags=0x{:x}, stack=0x{:x}", a1, a2),
++        SyscallNumber::Execve => format!(
++            "path={}, argv=0x{:x}, envp=0x{:x}",
++            cstr_preview(a1 as *const u8),
++            a2,
++            a3
++        ),
++        SyscallNumber::Exit => format!("status={}", a1 as i32),
++        SyscallNumber::Wait4 => format!(
++            "pid={}, status=0x{:x}, options=0x{:x}",
++            a1 as i32,
++            a2,
++            a3
++        ),
++        SyscallNumber::Socket => format!("domain={}, type={}, proto={}", a1, a2, a3),
++        SyscallNumber::Connect | SyscallNumber::Bind => {
++            format!("fd={}, addr=0x{:x}, addrlen={}", a1 as i32, a2, a3)
++        }
++        SyscallNumber::ClockGettime => format!("clockid={}, tp=0x{:x}", a1 as i32, a2),
++        SyscallNumber::Nanosleep => format!("req=0x{:x}, rem=0x{:x}", a1, a2),
++        SyscallNumber::Getrandom => format!("buf=0x{:x}, buflen={}, flags=0x{:x}", a1, a2, a3),
++        SyscallNumber::RtSigaction => format!("signum={}, act=0x{:x}", a1 as i32, a2),
++        SyscallNumber::Ioctl => format!("fd={}, request=0x{:x}, arg=0x{:x}", a1 as i32, a2, a3),
++        SyscallNumber::Lseek => format!("fd={}, offset={}, whence={}", a1 as i32, a2 as i64, a3),
++        _ => format!(
++            "arg1=0x{:x}, arg2=0x{:x}, arg3=0x{:x}, arg4=0x{:x}, arg5=0x{:x}, arg6=0x{:x}",
++            a1, a2, a3, a4, a5, a6
++        ),
++    }
++}
++
++fn cstr_preview(ptr: *const u8) -> String {
++    if ptr.is_null() {
++        return String::from("NULL");
++    }
++    let mut out = String::from("\"");
++    for i in 0..96 {
++        let byte = unsafe { *ptr.add(i) };
++        if byte == 0 {
++            break;
++        }
++        if byte.is_ascii_graphic() || byte == b' ' {
++            out.push(byte as char);
++        } else {
++            out.push_str(&format!("\\x{byte:02x}"));
++        }
++    }
++    out.push('"');
++    out
++}
++
++fn syscall_name(num: SyscallNumber) -> &'static str {
++    match num {
++        SyscallNumber::Read => "read",
++        SyscallNumber::Write => "write",
++        SyscallNumber::Open => "open",
++        SyscallNumber::Close => "close",
++        SyscallNumber::Stat => "stat",
++        SyscallNumber::Fstat => "fstat",
++        SyscallNumber::Lstat => "lstat",
++        SyscallNumber::Poll => "poll",
++        SyscallNumber::Lseek => "lseek",
++        SyscallNumber::Mmap => "mmap",
++        SyscallNumber::Mprotect => "mprotect",
++        SyscallNumber::Munmap => "munmap",
++        SyscallNumber::Brk => "brk",
++        SyscallNumber::RtSigaction => "rt_sigaction",
++        SyscallNumber::RtSigprocmask => "rt_sigprocmask",
++        SyscallNumber::RtSigreturn => "rt_sigreturn",
++        SyscallNumber::Ioctl => "ioctl",
++        SyscallNumber::Pipe => "pipe",
++        SyscallNumber::Dup => "dup",
++        SyscallNumber::Dup2 => "dup2",
++        SyscallNumber::Nanosleep => "nanosleep",
++        SyscallNumber::GetPid => "getpid",
++        SyscallNumber::Socket => "socket",
++        SyscallNumber::Connect => "connect",
++        SyscallNumber::Accept => "accept",
++        SyscallNumber::Accept4 => "accept4",
++        SyscallNumber::Bind => "bind",
++        SyscallNumber::Listen => "listen",
++        SyscallNumber::Clone => "clone",
++        SyscallNumber::Fork => "fork",
++        SyscallNumber::Execve => "execve",
++        SyscallNumber::Exit => "exit",
++        SyscallNumber::Wait4 => "wait4",
++        SyscallNumber::Kill => "kill",
++        SyscallNumber::Uname => "uname",
++        SyscallNumber::Fcntl => "fcntl",
++        SyscallNumber::Futex => "futex",
++        SyscallNumber::Getdents64 => "getdents64",
++        SyscallNumber::Getcwd => "getcwd",
++        SyscallNumber::Chdir => "chdir",
++        SyscallNumber::Openat => "openat",
++        SyscallNumber::Newfstatat => "newfstatat",
++        SyscallNumber::ClockGettime => "clock_gettime",
++        SyscallNumber::EpollCreate1 => "epoll_create1",
++        SyscallNumber::EpollCtl => "epoll_ctl",
++        SyscallNumber::EpollWait => "epoll_wait",
++        SyscallNumber::EpollPwait => "epoll_pwait",
++        SyscallNumber::Pipe2 => "pipe2",
++        SyscallNumber::Getrandom => "getrandom",
++        SyscallNumber::Prlimit64 => "prlimit64",
++        SyscallNumber::SetRobustList => "set_robust_list",
++        SyscallNumber::GetRobustList => "get_robust_list",
++        SyscallNumber::SetTidAddress => "set_tid_address",
++        SyscallNumber::ArchPrctl => "arch_prctl",
++        SyscallNumber::Readlink => "readlink",
++        SyscallNumber::Readlinkat => "readlinkat",
++        SyscallNumber::Mremap => "mremap",
++        SyscallNumber::SchedYield => "sched_yield",
++        SyscallNumber::ExitGroup => "exit_group",
++        SyscallNumber::Invalid => "invalid",
++        other => {
++            let _ = other;
++            "syscall"
++        }
++    }
++}
+diff --git a/src/linux_compat/file_ops.rs b/src/linux_compat/file_ops.rs
+index 44da58f..a531cd4 100644
+--- a/src/linux_compat/file_ops.rs
++++ b/src/linux_compat/file_ops.rs
+@@ -165,6 +165,10 @@ pub fn read(fd: Fd, buf: *mut u8, count: usize) -> LinuxResult<isize> {
+ 
+     let buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+ 
++    if let Some(result) = super::special_fd::try_read(fd, buffer) {
++        return result;
++    }
++
+     match vfs::vfs_read(fd, buffer) {
+         Ok(n) => Ok(n as isize),
+         Err(e) => Err(vfs_error_to_linux(e)),
+@@ -185,6 +189,10 @@ pub fn write(fd: Fd, buf: *const u8, count: usize) -> LinuxResult<isize> {
+ 
+     let buffer = unsafe { core::slice::from_raw_parts(buf, count) };
+ 
++    if let Some(result) = super::special_fd::try_write(fd, buffer) {
++        return result;
++    }
++
+     match vfs::vfs_write(fd, buffer) {
+         Ok(n) => Ok(n as isize),
+         Err(e) => Err(vfs_error_to_linux(e)),
+diff --git a/src/main.rs b/src/main.rs
+index 8430190..4d1c49d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -90,6 +90,7 @@ mod error;
+ mod health;
+ // Include comprehensive logging and debugging
+ mod logging;
++mod debug;
+ // Include comprehensive testing framework
+ mod testing;
+ // Include testing framework core (used by testing module)
+diff --git a/src/syscall_handler.rs b/src/syscall_handler.rs
+index f0719f8..96664f6 100644
+--- a/src/syscall_handler.rs
++++ b/src/syscall_handler.rs
+@@ -27,7 +27,7 @@ pub fn dispatch_syscall(
+     arg5: u64,
+     arg6: u64,
+ ) -> i64 {
+-    match SyscallNumber::from_u64(syscall_num) {
++    let result = match SyscallNumber::from_u64(syscall_num) {
+         // File operations
+         SyscallNumber::Read => syscall_read(arg1 as i32, arg2 as *mut u8, arg3 as usize),
+         SyscallNumber::Write => syscall_write(arg1 as i32, arg2 as *const u8, arg3 as usize),
+@@ -338,7 +338,9 @@ pub fn dispatch_syscall(
+         SyscallNumber::Setitimer => syscall_setitimer(arg1 as i32, arg2 as *const u8, arg3 as *mut u8),
+ 
+         _ => -38, // ENOSYS
+-    }
++    };
++    crate::debug::trace_syscall(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6, result);
++    result
+ }
+ 
+ // Syscall implementations - these call into linux_compat
+diff --git a/src/vfs/devfs.rs b/src/vfs/devfs.rs
+new file mode 100644
+index 0000000..27c58e0
+--- /dev/null
++++ b/src/vfs/devfs.rs
+@@ -0,0 +1,190 @@
++//! Device nodes under `/dev` for the syscall-facing VFS.
++
++extern crate alloc;
++
++use alloc::sync::Arc;
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++
++use super::{InodeOps, InodeType, Stat, VfsError, VfsResult};
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum DevKind {
++    Null,
++    Zero,
++    Random,
++    URandom,
++    Full,
++    Console,
++}
++
++struct DevInode {
++    ino: u64,
++    kind: DevKind,
++    mode: u32,
++    prng: AtomicU64,
++}
++
++impl DevInode {
++    fn new(ino: u64, kind: DevKind, mode: u32) -> Arc<Self> {
++        Arc::new(Self {
++            ino,
++            kind,
++            mode,
++            prng: AtomicU64::new(0x1234_5678_9abc_def0),
++        })
++    }
++
++    fn fill_random(&self, buf: &mut [u8]) {
++        let mut state = self.prng.load(Ordering::Relaxed);
++        for byte in buf.iter_mut() {
++            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
++            *byte = (state >> 16) as u8;
++        }
++        self.prng.store(state, Ordering::Relaxed);
++    }
++}
++
++impl InodeOps for DevInode {
++    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
++        match self.kind {
++            DevKind::Null => Ok(0),
++            DevKind::Zero | DevKind::Full => {
++                buf.fill(0);
++                Ok(buf.len())
++            }
++            DevKind::Random | DevKind::URandom => {
++                self.fill_random(buf);
++                Ok(buf.len())
++            }
++            DevKind::Console => Ok(0),
++        }
++    }
++
++    fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
++        match self.kind {
++            DevKind::Null | DevKind::Zero | DevKind::Random | DevKind::URandom => Ok(buf.len()),
++            DevKind::Full => Err(VfsError::NoSpace),
++            DevKind::Console => {
++                if let Ok(text) = core::str::from_utf8(buf) {
++                    crate::serial_print!("{text}");
++                } else {
++                    for &b in buf {
++                        crate::serial_print!("{}", b as char);
++                    }
++                }
++                Ok(buf.len())
++            }
++        }
++    }
++
++    fn stat(&self) -> VfsResult<Stat> {
++        let (major, minor) = match self.kind {
++            DevKind::Null => (1, 3),
++            DevKind::Zero => (1, 5),
++            DevKind::Random => (1, 8),
++            DevKind::URandom => (1, 9),
++            DevKind::Full => (1, 7),
++            DevKind::Console => (5, 1),
++        };
++        Ok(Stat {
++            ino: self.ino,
++            inode_type: InodeType::CharDevice,
++            size: 0,
++            blksize: 4096,
++            blocks: 0,
++            mode: self.mode,
++            nlink: 1,
++            uid: 0,
++            gid: 0,
++            rdev: ((major as u64) << 8) | minor as u64,
++            atime: 0,
++            mtime: 0,
++            ctime: 0,
++        })
++    }
++
++    fn truncate(&self, _size: u64) -> VfsResult<()> {
++        Err(VfsError::NotSupported)
++    }
++
++    fn sync(&self) -> VfsResult<()> {
++        Ok(())
++    }
++
++    fn lookup(&self, _name: &str) -> VfsResult<Arc<dyn InodeOps>> {
++        Err(VfsError::NotDirectory)
++    }
++
++    fn create(
++        &self,
++        _name: &str,
++        _inode_type: InodeType,
++        _mode: u32,
++    ) -> VfsResult<Arc<dyn InodeOps>> {
++        Err(VfsError::ReadOnly)
++    }
++
++    fn unlink(&self, _name: &str) -> VfsResult<()> {
++        Err(VfsError::ReadOnly)
++    }
++
++    fn link(&self, _name: &str, _target: Arc<dyn InodeOps>) -> VfsResult<()> {
++        Err(VfsError::ReadOnly)
++    }
++
++    fn rename(
++        &self,
++        _old_name: &str,
++        _new_dir: Arc<dyn InodeOps>,
++        _new_name: &str,
++    ) -> VfsResult<()> {
++        Err(VfsError::ReadOnly)
++    }
++
++    fn readdir(&self) -> VfsResult<alloc::vec::Vec<super::DirEntry>> {
++        Err(VfsError::NotDirectory)
++    }
++
++    fn inode_type(&self) -> InodeType {
++        InodeType::CharDevice
++    }
++
++    fn attach_child(&self, _name: &str, _child: Arc<dyn InodeOps>) -> VfsResult<()> {
++        Err(VfsError::NotDirectory)
++    }
++}
++
++static NEXT_DEV_INO: AtomicU32 = AtomicU32::new(10_000);
++
++fn alloc_dev_ino() -> u64 {
++    NEXT_DEV_INO.fetch_add(1, Ordering::Relaxed) as u64
++}
++
++fn attach(dev_dir: &Arc<dyn InodeOps>, name: &str, inode: Arc<dyn InodeOps>) -> VfsResult<()> {
++    dev_dir.attach_child(name, inode)
++}
++
++/// Populate `/dev` with standard Linux device nodes.
++pub fn install_dev(root: Arc<dyn InodeOps>) -> VfsResult<()> {
++    let dev = root.lookup("dev")?;
++    attach(&dev, "null", DevInode::new(alloc_dev_ino(), DevKind::Null, 0o666))?;
++    attach(&dev, "zero", DevInode::new(alloc_dev_ino(), DevKind::Zero, 0o666))?;
++    attach(
++        &dev,
++        "random",
++        DevInode::new(alloc_dev_ino(), DevKind::Random, 0o644),
++    )?;
++    attach(
++        &dev,
++        "urandom",
++        DevInode::new(alloc_dev_ino(), DevKind::URandom, 0o644),
++    )?;
++    attach(&dev, "full", DevInode::new(alloc_dev_ino(), DevKind::Full, 0o666))?;
++    attach(
++        &dev,
++        "console",
++        DevInode::new(alloc_dev_ino(), DevKind::Console, 0o600),
++    )?;
++    attach(&dev, "tty", DevInode::new(alloc_dev_ino(), DevKind::Console, 0o666))?;
++    Ok(())
++}
+diff --git a/src/vfs/file_descriptor.rs b/src/vfs/file_descriptor.rs
+index 18a1477..f0616b1 100644
+--- a/src/vfs/file_descriptor.rs
++++ b/src/vfs/file_descriptor.rs
+@@ -131,6 +131,14 @@ impl OpenFileTable {
+         Ok(())
+     }
+ 
++    /// Snapshot open file descriptors for debugging.
++    pub fn snapshot(&self) -> alloc::vec::Vec<(i32, FdKind)> {
++        self.files
++            .iter()
++            .map(|(&fd, file)| (fd, file.kind.clone()))
++            .collect()
++    }
++
+     /// Duplicate a file descriptor
+     pub fn duplicate(&mut self, fd: i32) -> VfsResult<i32> {
+         let file = self.get(fd)?;
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index 0cbf97f..e5ce278 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -16,6 +16,7 @@ use alloc::vec::Vec;
+ use core::sync::atomic::{AtomicU64, Ordering};
+ use spin::{Mutex, RwLock};
+ 
++pub mod devfs;
+ pub mod file_descriptor;
+ pub mod procfs;
+ pub mod ramfs;
+@@ -237,6 +238,11 @@ pub trait InodeOps: Send + Sync {
+         Err(VfsError::NotSupported)
+     }
+ 
++    /// Attach an existing inode as a directory entry (device nodes, etc.)
++    fn attach_child(&self, _name: &str, _child: Arc<dyn InodeOps>) -> VfsResult<()> {
++        Err(VfsError::NotSupported)
++    }
++
+     /// Write the target path for a symbolic link (default: not supported)
+     fn write_symlink_target(&self, _target: &str) -> VfsResult<()> {
+         Err(VfsError::NotSupported)
+@@ -341,7 +347,8 @@ impl Vfs {
+         let _ = root.create("home", InodeType::Directory, 0o755);
+         let _ = root.create("etc", InodeType::Directory, 0o755);
+         let _ = root.create("bin", InodeType::Directory, 0o755);
+-        let _ = procfs::install_proc(root);
++        let _ = procfs::install_proc(root.clone());
++        let _ = devfs::install_dev(root);
+ 
+         Ok(())
+     }
+@@ -523,6 +530,12 @@ impl Vfs {
+         file_table.kind(fd)
+     }
+ 
++    /// Snapshot open fds for syscall tracing.
++    pub fn open_fd_snapshot(&self) -> Vec<(i32, FdKind)> {
++        let file_table = self.file_table.lock();
++        file_table.snapshot()
++    }
++
+     /// Close a file descriptor
+     pub fn close(&self, fd: i32) -> VfsResult<()> {
+         let mut file_table = self.file_table.lock();
+diff --git a/src/vfs/ramfs.rs b/src/vfs/ramfs.rs
+index c85400f..50e0925 100644
+--- a/src/vfs/ramfs.rs
++++ b/src/vfs/ramfs.rs
+@@ -18,7 +18,7 @@ enum RamFsInodeData {
+     /// File data (content)
+     File(RwLock<Vec<u8>>),
+     /// Directory entries (name -> inode)
+-    Directory(RwLock<BTreeMap<String, Arc<RamFsInode>>>),
++    Directory(RwLock<BTreeMap<String, Arc<dyn InodeOps>>>),
+     /// Symbolic link target path
+     Symlink(RwLock<String>),
+ }
+@@ -221,7 +221,7 @@ impl InodeOps for RamFsInode {
+                 let entries = entries.read();
+                 entries
+                     .get(name)
+-                    .map(|inode| Arc::clone(inode) as Arc<dyn InodeOps>)
++                    .cloned()
+                     .ok_or(VfsError::NotFound)
+             }
+             RamFsInodeData::File(_) => Err(VfsError::NotDirectory),
+@@ -253,7 +253,7 @@ impl InodeOps for RamFsInode {
+                 let ino = super::get_vfs().alloc_ino();
+ 
+                 // Create new inode
+-                let new_inode = match inode_type {
++                let new_inode: Arc<dyn InodeOps> = match inode_type {
+                     InodeType::File => RamFsInode::new_file(ino, mode),
+                     InodeType::Directory => RamFsInode::new_directory(ino, mode),
+                     InodeType::Symlink => RamFsInode::new_symlink(ino, ""),
+@@ -265,7 +265,7 @@ impl InodeOps for RamFsInode {
+                 // Increment link count
+                 *self.nlink.write() += 1;
+ 
+-                Ok(new_inode as Arc<dyn InodeOps>)
++                Ok(new_inode)
+             }
+             RamFsInodeData::File(_) => Err(VfsError::NotDirectory),
+             RamFsInodeData::Symlink(_) => Err(VfsError::NotDirectory),
+@@ -278,10 +278,7 @@ impl InodeOps for RamFsInode {
+                 self.update_mtime();
+ 
+                 let mut entries = entries.write();
+-                let inode = entries.remove(name).ok_or(VfsError::NotFound)?;
+-
+-                // Decrement link count
+-                *inode.nlink.write() -= 1;
++                let _inode = entries.remove(name).ok_or(VfsError::NotFound)?;
+                 *self.nlink.write() -= 1;
+ 
+                 Ok(())
+@@ -311,25 +308,7 @@ impl InodeOps for RamFsInode {
+                     return Err(VfsError::AlreadyExists);
+                 }
+ 
+-                // Downcast to RamFsInode
+-                let target_ramfs = target.as_ref() as *const dyn InodeOps as *const RamFsInode;
+-
+-                // This is unsafe but necessary for the link operation
+-                let target_ramfs = unsafe { &*target_ramfs };
+-
+-                // Create a new Arc pointing to the same inode
+-                let target_arc = unsafe { Arc::from_raw(target_ramfs as *const RamFsInode) };
+-
+-                // Increment reference count by cloning
+-                let target_clone = Arc::clone(&target_arc);
+-
+-                // Forget the temporary Arc to avoid double-free
+-                core::mem::forget(target_arc);
+-
+-                entries.insert(String::from(name), target_clone);
+-
+-                // Increment link count
+-                *target_ramfs.nlink.write() += 1;
++                entries.insert(String::from(name), Arc::clone(&target));
+                 *self.nlink.write() += 1;
+ 
+                 Ok(())
+@@ -349,7 +328,7 @@ impl InodeOps for RamFsInode {
+                 };
+ 
+                 // Add to destination directory
+-                new_dir.link(new_name, inode as Arc<dyn InodeOps>)?;
++                new_dir.link(new_name, inode)?;
+ 
+                 self.update_mtime();
+                 Ok(())
+@@ -368,10 +347,11 @@ impl InodeOps for RamFsInode {
+                 let mut result = Vec::with_capacity(entries.len());
+ 
+                 for (name, inode) in entries.iter() {
++                    let stat = inode.stat()?;
+                     result.push(DirEntry {
+-                        ino: inode.ino,
++                        ino: stat.ino,
+                         name: name.clone(),
+-                        inode_type: inode.inode_type,
++                        inode_type: inode.inode_type(),
+                     });
+                 }
+ 
+@@ -404,6 +384,27 @@ impl InodeOps for RamFsInode {
+         }
+     }
+ 
++    fn attach_child(&self, name: &str, child: Arc<dyn InodeOps>) -> VfsResult<()> {
++        match &self.data {
++            RamFsInodeData::Directory(entries) => {
++                if name.len() > 255 {
++                    return Err(VfsError::NameTooLong);
++                }
++                if name.contains('/') || name == "." || name == ".." {
++                    return Err(VfsError::InvalidArgument);
++                }
++                let mut entries = entries.write();
++                if entries.contains_key(name) {
++                    return Err(VfsError::AlreadyExists);
++                }
++                entries.insert(String::from(name), child);
++                *self.nlink.write() += 1;
++                Ok(())
++            }
++            RamFsInodeData::File(_) | RamFsInodeData::Symlink(_) => Err(VfsError::NotDirectory),
++        }
++    }
++
+     fn set_mode(&self, mode: u32) -> VfsResult<()> {
+         self.mode.store(mode, Ordering::Relaxed);
+         *self.ctime.write() = get_time();
+-- 
+2.43.0
+
