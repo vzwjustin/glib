@@ -123,9 +123,20 @@ impl GArray {
         assert!((index as usize) < state.len as usize, "index out of bounds");
         let offset = elt_pos(&state, index);
         let size = state.elt_size as usize;
-        let mut bytes = [0u8; 4];
-        bytes[..size.min(4)].copy_from_slice(&state.data[offset..offset + size.min(4)]);
-        i32::from_ne_bytes(bytes)
+        match size {
+            1 => state.data[offset] as i8 as i32,
+            2 => {
+                let mut bytes = [0u8; 2];
+                bytes.copy_from_slice(&state.data[offset..offset + 2]);
+                i16::from_ne_bytes(bytes) as i32
+            }
+            _ => {
+                let mut bytes = [0u8; 4];
+                let copy_len = size.min(4);
+                bytes[..copy_len].copy_from_slice(&state.data[offset..offset + copy_len]);
+                i32::from_ne_bytes(bytes)
+            }
+        }
     }
 
     /// Increase reference count (`g_array_ref`).
