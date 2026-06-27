@@ -17,7 +17,7 @@ struct QuarkGlobal {
     ht: HashMap<&'static str, Quark>,
     quarks: Vec<Option<&'static str>>,
     next_id: Quark,
-    string_block: Option<Vec<u8>>,
+    string_block: Option<&'static mut [u8]>,
     string_block_offset: usize,
 }
 
