@@ -68,7 +68,7 @@ pub struct GTreeNode {
     pub right_child: u8,
 }
 
-const MAX_GTREE_HEIGHT: usize = 40;
+const MAX_GTREE_HEIGHT: usize = 48;
 
 enum KeyCompare {
     Plain(CompareFn),
