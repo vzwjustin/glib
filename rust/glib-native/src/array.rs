@@ -4,9 +4,9 @@ use crate::checked::checked_mul_size;
 use crate::mem::realloc;
 use crate::refcount::AtomicRefCount;
 use crate::UInt;
-use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const MIN_ARRAY_SIZE: usize = 16;
 
@@ -21,7 +21,7 @@ struct GArrayState {
 }
 
 struct GArrayInner {
-    state: RefCell<GArrayState>,
+    state: Mutex<GArrayState>,
     ref_count: AtomicRefCount,
 }
 
@@ -43,6 +43,13 @@ impl Drop for GArray {
 }
 
 impl GArray {
+    fn state(&self) -> MutexGuard<'_, GArrayState> {
+        self.inner
+            .state
+            .lock()
+            .expect("GArray state mutex poisoned")
+    }
+
     /// Create a new array (`g_array_new`).
     pub fn new(zero_terminated: bool, clear: bool, element_size: UInt) -> Self {
         assert!(element_size > 0, "element_size must be > 0");
@@ -67,7 +74,7 @@ impl GArray {
 
         let array = Self {
             inner: Arc::new(GArrayInner {
-                state: RefCell::new(GArrayState {
+                state: Mutex::new(GArrayState {
                     data: Vec::new(),
                     len: 0,
                     elt_capacity: 0,
@@ -90,7 +97,7 @@ impl GArray {
 
     /// Element count (`len` field).
     pub fn len(&self) -> UInt {
-        self.inner.state.borrow().len
+        self.state().len
     }
 
     /// Whether the array contains no elements.
@@ -100,19 +107,19 @@ impl GArray {
 
     /// Element size in bytes (`g_array_get_element_size`).
     pub fn element_size(&self) -> UInt {
-        self.inner.state.borrow().elt_size
+        self.state().elt_size
     }
 
     /// Raw element storage (`data` field).
     pub fn data(&self) -> Vec<u8> {
-        let state = self.inner.state.borrow();
+        let state = self.state();
         let byte_len = elt_byte_len(&state, state.len);
         state.data[..byte_len].to_vec()
     }
 
     /// Read element `index` as `i32` (mirrors `g_array_index` for `gint`).
     pub fn index_i32(&self, index: UInt) -> i32 {
-        let state = self.inner.state.borrow();
+        let state = self.state();
         assert!((index as usize) < state.len as usize, "index out of bounds");
         let offset = elt_pos(&state, index);
         let size = state.elt_size as usize;
@@ -137,7 +144,7 @@ impl GArray {
 
     /// Shallow copy (`g_array_copy`).
     pub fn copy(&self) -> Self {
-        let state = self.inner.state.borrow();
+        let state = self.state();
         let copy = Self::sized_new(
             state.zero_terminated,
             state.clear,
@@ -145,7 +152,7 @@ impl GArray {
             state.len,
         );
         {
-            let mut copy_state = copy.inner.state.borrow_mut();
+            let mut copy_state = copy.state();
             copy_state.len = state.len;
             let byte_len = elt_byte_len(&state, state.len);
             if byte_len > 0 {
@@ -165,7 +172,7 @@ impl GArray {
     pub fn free(self, free_segment: bool) -> Option<Vec<u8>> {
         let preserve = Arc::strong_count(&self.inner) > 1;
         let segment = {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             if free_segment {
                 state.data.clear();
                 None
@@ -180,7 +187,7 @@ impl GArray {
             }
         };
         if preserve {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             state.len = 0;
             state.elt_capacity = 0;
         }
@@ -195,15 +202,12 @@ impl GArray {
         let data = data.expect("data must be non-null when len > 0");
         self.maybe_expand(len);
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             let dst = elt_pos(&state, state.len);
             let copy_len = elt_byte_len(&state, len);
             assert!(data.len() >= copy_len, "data too short for append");
             state.data[dst..dst + copy_len].copy_from_slice(&data[..copy_len]);
-            state.len = state
-                .len
-                .checked_add(len)
-                .expect("array length overflow");
+            state.len = state.len.checked_add(len).expect("array length overflow");
         }
         self.zero_terminate();
         self
@@ -217,17 +221,14 @@ impl GArray {
         let data = data.expect("data must be non-null when len > 0");
         self.maybe_expand(len);
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             let old_byte_len = elt_byte_len(&state, state.len);
             let new_byte_len = elt_byte_len(&state, len);
             let dst = new_byte_len;
             state.data.resize(old_byte_len + new_byte_len, 0);
             state.data.copy_within(0..old_byte_len, dst);
             state.data[..new_byte_len].copy_from_slice(&data[..new_byte_len]);
-            state.len = state
-                .len
-                .checked_add(len)
-                .expect("array length overflow");
+            state.len = state.len.checked_add(len).expect("array length overflow");
         }
         self.zero_terminate();
         self
@@ -250,7 +251,7 @@ impl GArray {
 
         self.maybe_expand(len);
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             let tail = cur_len - index;
             let insert_bytes = elt_byte_len(&state, len);
             let tail_bytes = elt_byte_len(&state, tail);
@@ -258,12 +259,13 @@ impl GArray {
             let new_data_len = state.data.len() + insert_bytes;
 
             state.data.resize(new_data_len, 0);
-            state.data.copy_within(index_bytes..index_bytes + tail_bytes, index_bytes + insert_bytes);
+            state.data.copy_within(
+                index_bytes..index_bytes + tail_bytes,
+                index_bytes + insert_bytes,
+            );
             state.data[index_bytes..index_bytes + insert_bytes]
                 .copy_from_slice(&data[..insert_bytes]);
-            state.len = cur_len
-                .checked_add(len)
-                .expect("array length overflow");
+            state.len = cur_len.checked_add(len).expect("array length overflow");
         }
         self.zero_terminate();
         self
@@ -272,18 +274,22 @@ impl GArray {
     /// Set element count (`g_array_set_size`).
     pub fn set_size(&self, length: UInt) -> &Self {
         let cur_len = self.len();
-        if length > cur_len {
-            self.maybe_expand(length - cur_len);
-            let mut state = self.inner.state.borrow_mut();
-            if state.clear {
-                let start = elt_pos(&state, cur_len);
-                let end = elt_pos(&state, length);
-                state.data[start..end].fill(0);
+        match length.cmp(&cur_len) {
+            Ordering::Greater => {
+                self.maybe_expand(length - cur_len);
+                let mut state = self.state();
+                if state.clear {
+                    let start = elt_pos(&state, cur_len);
+                    let end = elt_pos(&state, length);
+                    state.data[start..end].fill(0);
+                }
             }
-        } else if length < cur_len {
-            self.remove_range(length, cur_len - length);
+            Ordering::Less => {
+                self.remove_range(length, cur_len - length);
+            }
+            Ordering::Equal => {}
         }
-        self.inner.state.borrow_mut().len = length;
+        self.state().len = length;
         self.zero_terminate();
         self
     }
@@ -294,7 +300,7 @@ impl GArray {
         assert!((index as usize) < len as usize, "index out of bounds");
 
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             if index != len - 1 {
                 let dst = elt_pos(&state, index);
                 let src = elt_pos(&state, index + 1);
@@ -314,7 +320,7 @@ impl GArray {
         assert!((index as usize) < len as usize, "index out of bounds");
 
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             if index != len - 1 {
                 let dst = elt_pos(&state, index);
                 let src = elt_pos(&state, len - 1);
@@ -344,7 +350,7 @@ impl GArray {
         }
 
         {
-            let mut state = self.inner.state.borrow_mut();
+            let mut state = self.state();
             if index + length != len {
                 let dst = elt_pos(&state, index);
                 let src = elt_pos(&state, index + length);
@@ -359,12 +365,12 @@ impl GArray {
     }
 
     fn maybe_expand(&self, len: UInt) {
-        let mut state = self.inner.state.borrow_mut();
+        let mut state = self.state();
         maybe_expand_state(&mut state, len);
     }
 
     fn zero_terminate(&self) {
-        let mut state = self.inner.state.borrow_mut();
+        let mut state = self.state();
         if !state.zero_terminated {
             return;
         }
@@ -412,6 +418,11 @@ impl ByteArray {
     /// Element count.
     pub fn len(&self) -> UInt {
         self.0.len()
+    }
+
+    /// Whether the byte array is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Raw bytes.
@@ -539,18 +550,22 @@ fn nearest_pow(num: usize) -> usize {
     n + 1
 }
 
+#[cfg(test)]
 fn append_i32(array: &GArray, value: i32) {
     array.append_vals(Some(&value.to_ne_bytes()), 1);
 }
 
+#[cfg(test)]
 fn prepend_i32(array: &GArray, value: i32) {
     array.prepend_vals(Some(&value.to_ne_bytes()), 1);
 }
 
+#[cfg(test)]
 fn int_array_from(array: &GArray) -> Vec<i32> {
     (0..array.len()).map(|i| array.index_i32(i)).collect()
 }
 
+#[cfg(test)]
 fn assert_int_array_equal(array: &GArray, expected: &[i32]) {
     assert_eq!(array.len() as usize, expected.len());
     for (i, &exp) in expected.iter().enumerate() {
