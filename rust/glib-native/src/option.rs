@@ -933,8 +933,8 @@ fn revert_changes(context: &mut OptionContext) {
                 }
             },
             OptionArg::StringArray | OptionArg::FilenameArray => unsafe {
-                if let Some(target) = (change.arg_data as *mut Vec<String>).as_mut() {
-                    target.truncate(change.prev_array_len);
+                if change.had_array {
+                    *(change.arg_data as *mut Vec<String>) = change.prev_array.clone();
                 }
             },
             OptionArg::Callback | OptionArg::Double | OptionArg::Int64 => {}
