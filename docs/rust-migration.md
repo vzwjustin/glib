@@ -53,7 +53,25 @@ The crate is named `glib-native` to avoid confusion with the existing
 | **12** | GObject Introspection & tools | `girepository/*`, `tools/*` | Planned |
 | **13** | Remove C implementations; expose stable C ABI from Rust via `extern "C"` | all | Planned |
 
-## Phase 2 detail (current)
+## Phase 3 detail (current)
+
+### Modules
+
+- **`array`** — `GArray`, `ByteArray` with `Mutex`-protected state and atomic ref counting.
+- **`list`** — safe `List` / `SList` wrappers; `GList` / `GSList` remain `#[repr(C)]` layouts.
+- **`queue`** — generic `GQueue<T>` double-ended queue.
+- **`ptr_array`** — `PtrArray` pointer array with ref counting and free-func support.
+
+### Exit criteria
+
+- `cargo test` passes (114 unit tests).
+- No `#![allow(clippy::...)]` suppressions; clippy clean with `-D warnings`.
+
+### Next (Phase 4)
+
+Port `ghash`, `gtree`, `gdataset`, and `gquark`.
+
+## Phase 2 detail
 
 ### Modules
 

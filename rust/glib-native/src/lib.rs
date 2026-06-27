@@ -1,21 +1,26 @@
 //! Native Rust reimplementation of GLib.
 //!
 //! See [`docs/rust-migration.md`](../../docs/rust-migration.md) for the phased
-//! migration plan. Phases 0–1 cover endian helpers, checked arithmetic,
-//! reference counting, and [`Bytes`]. Phase 2 adds atomics, memory, and strings.
+//! migration plan. Phases 0–1 cover foundation types; Phase 2 adds atomics,
+//! memory, and strings; Phase 3 adds sequential containers.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod array;
 pub mod atomic;
 pub mod bytes;
 pub mod checked;
 pub mod endian;
 pub mod gstring;
+pub mod list;
 pub mod mem;
+pub mod ptr_array;
+pub mod queue;
 pub mod refcount;
 pub mod strfuncs;
 
+pub use array::{ByteArray, GArray};
 pub use atomic::{AtomicInt, AtomicPointer, AtomicUInt};
 pub use bytes::Bytes;
 pub use checked::{checked_add_size, checked_add_u32, checked_mul_size, checked_mul_u32};
@@ -23,11 +28,14 @@ pub use endian::{
     g_htonl, g_htons, g_ntohl, g_ntohs, swap_u16_le_be, swap_u32_le_be, swap_u64_le_be,
 };
 pub use gstring::GString;
+pub use list::{CompareFn, GList, GSList, List, SList};
 pub use mem::{
     aligned_alloc, aligned_alloc0, clear, clear_with, free, malloc, malloc0, malloc0_n, malloc_n,
     memdup, memdup2, realloc, realloc_n, steal, try_aligned_alloc, try_malloc, try_malloc0,
     try_malloc0_n, try_malloc_n, try_realloc, try_realloc_n, AlignedBuffer, MEM_ALIGN,
 };
+pub use ptr_array::{GPointer, PtrArray, PtrCompareFunc};
+pub use queue::GQueue;
 pub use refcount::{AtomicRefCount, RefCount};
 pub use strfuncs::{
     ascii_strcasecmp, str_has_prefix, str_has_suffix, strcasecmp, strchomp, strchug, strcmp,
