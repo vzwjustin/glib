@@ -41,9 +41,9 @@ The crate is named `glib-native` to avoid confusion with the existing
 | **0** | Tooling: Cargo workspace, `cargo test` in CI, migration docs | — | **Done** |
 | **1** | Foundation types: endian swaps, checked arithmetic, refcounts, `GBytes` | `gtypes.h`, `grefcount.*`, `gbytes.*` | **Done** |
 | **2** | Atomics, memory helpers, strings | `gatomic.*`, `gmem.*`, `gstrfuncs.*`, `gstring.*` | **Done** |
-| **3** | Sequential containers | `garray.*`, `glist.*`, `gslist.*`, `gqueue.*`, `gptrarray.*` | Planned |
-| **4** | Associative containers & datasets | `ghash.*`, `gtree.*`, `gdataset.*`, `gquark.*` | Planned |
-| **5** | Errors, logging, options | `gerror.*`, `gmessages.*`, `goption.*` | Planned |
+| **3** | Sequential containers | `garray.*`, `glist.*`, `gslist.*`, `gqueue.*`, `gptrarray.*` | **Done** |
+| **4** | Associative containers & datasets | `ghash.*`, `gtree.*`, `gdataset.*`, `gquark.*` | **Done** |
+| **5** | Errors, logging, options | `gerror.*`, `gmessages.*`, `goption.*` | **Done** |
 | **6** | I/O primitives | `gfileutils.*`, `gconvert.*`, `gcharset.*`, `gchecksum.*`, `gbase64.*` | Planned |
 | **7** | Date/time & variants | `gdate.*`, `gdatetime.*`, `gvariant.*` | Planned |
 | **8** | Main loop & threading | `gmain.*`, `gsource.*`, `gthread.*`, `gasyncqueue.*` | Planned |
@@ -53,7 +53,52 @@ The crate is named `glib-native` to avoid confusion with the existing
 | **12** | GObject Introspection & tools | `girepository/*`, `tools/*` | Planned |
 | **13** | Remove C implementations; expose stable C ABI from Rust via `extern "C"` | all | Planned |
 
-## Phase 3 detail (current)
+## Phase 5 detail (current)
+
+### Modules
+
+- **`error`** — `Error { domain, code, message }`, propagation (`propagate_error`),
+  prefixing, overwrite warnings via the logging layer.
+- **`messages`** — `LogLevelFlags`, `g_log` handler routing, default handler formatting,
+  `g_print` / `g_printerr` hooks.
+- **`option`** — `OptionContext`, `OptionGroup`, `OptionEntry`, argv parsing for bool,
+  string, int, string-array, filename, and callback arg types.
+
+### Exit criteria
+
+- `cargo test` passes (211 unit tests).
+- No `#![allow(clippy::...)]` suppressions; clippy clean with `-D warnings`.
+- Tests that touch global logging state are serialized to avoid parallel-test races.
+
+### Deferred
+
+- Extended error domains (`G_DEFINE_EXTENDED_ERROR`, `g_error_domain_register*`).
+- Structured logging (`g_log_structured*`, GVariant fields).
+- Full goption arg types (`Double`, `Int64`, help text generation).
+
+### Next (Phase 6)
+
+Port `gfileutils`, `gconvert`, `gcharset`, `gchecksum`, and `gbase64`.
+
+## Phase 4 detail
+
+### Modules
+
+- **`quark`** — string interning and quark table.
+- **`dataset`** — per-object `DataList` key/value attachments.
+- **`hash`** — open-addressing `HashTable` with prime moduli and tombstones.
+- **`tree`** — AVL `Tree` with traverse, search, and destroy callbacks.
+
+### Exit criteria
+
+- `cargo test` passes (160 unit tests).
+- No clippy allow bandaids.
+
+### Next (Phase 5)
+
+Port `gerror`, `gmessages`, and `goption`.
+
+## Phase 3 detail
 
 ### Modules
 

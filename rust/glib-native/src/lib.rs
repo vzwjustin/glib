@@ -12,10 +12,13 @@ pub mod bytes;
 pub mod checked;
 pub mod dataset;
 pub mod endian;
+pub mod error;
 pub mod gstring;
 pub mod hash;
 pub mod list;
 pub mod mem;
+pub mod messages;
+pub mod option;
 pub mod ptr_array;
 pub mod quark;
 pub mod queue;
@@ -34,6 +37,11 @@ pub use dataset::{
 pub use endian::{
     g_htonl, g_htons, g_ntohl, g_ntohs, swap_u16_le_be, swap_u32_le_be, swap_u64_le_be,
 };
+pub use error::{
+    clear_error, error_copy, error_free, error_matches, error_new, error_new_literal, prefix_error,
+    prefix_error_literal, propagate_error, propagate_prefixed_error, set_error, set_error_literal,
+    steal_error, Error,
+};
 pub use gstring::GString;
 pub use hash::{
     direct_equal, direct_hash, double_equal, double_hash, int64_equal, int64_hash, int_equal,
@@ -44,6 +52,15 @@ pub use mem::{
     aligned_alloc, aligned_alloc0, clear, clear_with, free, malloc, malloc0, malloc0_n, malloc_n,
     memdup, memdup2, realloc, realloc_n, steal, try_aligned_alloc, try_malloc, try_malloc0,
     try_malloc0_n, try_malloc_n, try_realloc, try_realloc_n, AlignedBuffer, MEM_ALIGN,
+};
+pub use messages::{
+    critical, debug, info, log, log_default_handler, log_fmt, log_remove_handler,
+    log_set_default_handler, log_set_handler, message, print, printerr, set_print_handler,
+    set_printerr_handler, warning, LogFunc, LogLevelFlags, PrintFunc,
+};
+pub use option::{
+    option_context_new, option_error_quark, option_group_new, OptionArg, OptionContext,
+    OptionEntry, OptionError, OptionFlags, OptionGroup, OPTION_REMAINING,
 };
 pub use ptr_array::{GPointer, PtrArray, PtrCompareFunc};
 pub use quark::{

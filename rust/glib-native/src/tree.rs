@@ -1085,7 +1085,6 @@ fn node_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
     static CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     static CHARS2: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -1113,19 +1112,30 @@ mod tests {
         my_compare(b, a)
     }
 
-    static DESTROYED_KEY: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-    static DESTROYED_VALUE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-    static DESTROYED_KEY_COUNT: AtomicU32 = AtomicU32::new(0);
-    static DESTROYED_VALUE_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static DESTROYED_KEY: std::cell::Cell<*mut c_void> =
+            std::cell::Cell::new(ptr::null_mut());
+        static DESTROYED_VALUE: std::cell::Cell<*mut c_void> =
+            std::cell::Cell::new(ptr::null_mut());
+        static DESTROYED_KEY_COUNT: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        static DESTROYED_VALUE_COUNT: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    }
+
+    fn reset_destroy_tracking() {
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
+        DESTROYED_VALUE.with(|slot| slot.set(ptr::null_mut()));
+        DESTROYED_KEY_COUNT.with(|slot| slot.set(0));
+        DESTROYED_VALUE_COUNT.with(|slot| slot.set(0));
+    }
 
     fn my_key_destroy(key: *mut c_void) {
-        DESTROYED_KEY.store(key, Ordering::SeqCst);
-        DESTROYED_KEY_COUNT.fetch_add(1, Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(key));
+        DESTROYED_KEY_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     }
 
     fn my_value_destroy(value: *mut c_void) {
-        DESTROYED_VALUE.store(value, Ordering::SeqCst);
-        DESTROYED_VALUE_COUNT.fetch_add(1, Ordering::SeqCst);
+        DESTROYED_VALUE.with(|slot| slot.set(value));
+        DESTROYED_VALUE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     }
 
     fn my_traverse(key: *mut c_void, _value: *mut c_void, _data: *mut c_void) -> bool {
@@ -1237,8 +1247,7 @@ mod tests {
 
     #[test]
     fn tree_remove() {
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
-        DESTROYED_VALUE.store(ptr::null_mut(), Ordering::SeqCst);
+        reset_destroy_tracking();
 
         let tree = Tree::new_full(
             my_compare_no_data,
@@ -1258,15 +1267,15 @@ mod tests {
             (&mut c as *mut u8).cast::<c_void>(),
         );
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&mut c as *mut u8).cast::<c_void>()
         );
         assert_eq!(
-            DESTROYED_VALUE.load(Ordering::SeqCst),
+            DESTROYED_VALUE.with(|slot| slot.get()),
             (&CHARS[0] as *const u8).cast::<c_void>().cast_mut()
         );
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
-        DESTROYED_VALUE.store(ptr::null_mut(), Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
+        DESTROYED_VALUE.with(|slot| slot.set(ptr::null_mut()));
 
         let mut d = b'1';
         tree.replace(
@@ -1274,15 +1283,15 @@ mod tests {
             (&mut d as *mut u8).cast::<c_void>(),
         );
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&CHARS[1] as *const u8).cast::<c_void>().cast_mut()
         );
         assert_eq!(
-            DESTROYED_VALUE.load(Ordering::SeqCst),
+            DESTROYED_VALUE.with(|slot| slot.get()),
             (&CHARS[1] as *const u8).cast::<c_void>().cast_mut()
         );
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
-        DESTROYED_VALUE.store(ptr::null_mut(), Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
+        DESTROYED_VALUE.with(|slot| slot.set(ptr::null_mut()));
 
         let mut e = 0xff_u8;
         let node = tree
@@ -1292,26 +1301,26 @@ mod tests {
             )
             .expect("insert_node");
         assert!(!node.is_null());
-        assert!(DESTROYED_KEY.load(Ordering::SeqCst).is_null());
-        assert!(DESTROYED_VALUE.load(Ordering::SeqCst).is_null());
+        assert!(DESTROYED_KEY.with(|slot| slot.get()).is_null());
+        assert!(DESTROYED_VALUE.with(|slot| slot.get()).is_null());
 
         let c2 = b'2';
         assert!(tree.remove((&c2 as *const u8).cast()));
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&CHARS[2] as *const u8).cast::<c_void>().cast_mut()
         );
         assert_eq!(
-            DESTROYED_VALUE.load(Ordering::SeqCst),
+            DESTROYED_VALUE.with(|slot| slot.get()),
             (&CHARS[2] as *const u8).cast::<c_void>().cast_mut()
         );
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
-        DESTROYED_VALUE.store(ptr::null_mut(), Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
+        DESTROYED_VALUE.with(|slot| slot.set(ptr::null_mut()));
 
         let c3 = b'3';
         assert!(tree.steal((&c3 as *const u8).cast()));
-        assert!(DESTROYED_KEY.load(Ordering::SeqCst).is_null());
-        assert!(DESTROYED_VALUE.load(Ordering::SeqCst).is_null());
+        assert!(DESTROYED_KEY.with(|slot| slot.get()).is_null());
+        assert!(DESTROYED_VALUE.with(|slot| slot.get()).is_null());
 
         let mut f = b'4';
         let node = tree
@@ -1322,11 +1331,11 @@ mod tests {
             .expect("replace_node");
         assert!(!node.is_null());
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&CHARS[4] as *const u8).cast::<c_void>().cast_mut()
         );
         assert_eq!(
-            DESTROYED_VALUE.load(Ordering::SeqCst),
+            DESTROYED_VALUE.with(|slot| slot.get()),
             (&CHARS[4] as *const u8).cast::<c_void>().cast_mut()
         );
 
@@ -1340,6 +1349,8 @@ mod tests {
 
     #[test]
     fn tree_remove_all() {
+        reset_destroy_tracking();
+
         let tree = Tree::new_full(
             my_compare_no_data,
             ptr::null_mut(),
@@ -1352,16 +1363,16 @@ mod tests {
             tree.insert(key, key);
         }
 
-        let destroyed_key_count = DESTROYED_KEY_COUNT.load(Ordering::SeqCst);
-        let destroyed_value_count = DESTROYED_VALUE_COUNT.load(Ordering::SeqCst);
+        let destroyed_key_count = DESTROYED_KEY_COUNT.with(|count| count.get());
+        let destroyed_value_count = DESTROYED_VALUE_COUNT.with(|count| count.get());
 
         tree.remove_all();
         assert_eq!(
-            DESTROYED_KEY_COUNT.load(Ordering::SeqCst) - destroyed_key_count,
+            DESTROYED_KEY_COUNT.with(|count| count.get()) - destroyed_key_count,
             CHARS.len() as u32
         );
         assert_eq!(
-            DESTROYED_VALUE_COUNT.load(Ordering::SeqCst) - destroyed_value_count,
+            DESTROYED_VALUE_COUNT.with(|count| count.get()) - destroyed_value_count,
             CHARS.len() as u32
         );
         assert_eq!(tree.height(), 0);
@@ -1589,7 +1600,7 @@ mod tests {
 
     #[test]
     fn tree_replace_vs_insert_key_destroy() {
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
+        reset_destroy_tracking();
         let tree = Tree::new_full(
             my_compare_no_data,
             ptr::null_mut(),
@@ -1599,16 +1610,16 @@ mod tests {
         let mut a = b'x';
         let mut b = b'x';
         tree.insert((&mut a as *mut u8).cast::<c_void>(), ptr::null_mut());
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
         tree.insert((&mut a as *mut u8).cast::<c_void>(), ptr::null_mut());
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&mut a as *mut u8).cast::<c_void>()
         );
-        DESTROYED_KEY.store(ptr::null_mut(), Ordering::SeqCst);
+        DESTROYED_KEY.with(|slot| slot.set(ptr::null_mut()));
         tree.replace((&mut b as *mut u8).cast::<c_void>(), ptr::null_mut());
         assert_eq!(
-            DESTROYED_KEY.load(Ordering::SeqCst),
+            DESTROYED_KEY.with(|slot| slot.get()),
             (&mut a as *mut u8).cast::<c_void>()
         );
         tree.unref();
