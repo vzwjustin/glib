@@ -1,8 +1,7 @@
 //! Native Rust reimplementation of GLib.
 //!
 //! See [`docs/rust-migration.md`](../../docs/rust-migration.md) for the phased
-//! migration plan. Phases 0–1 cover foundation types; Phase 2 adds atomics,
-//! memory, and strings; Phase 3 adds sequential containers.
+//! migration plan.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -11,23 +10,35 @@ pub mod array;
 pub mod atomic;
 pub mod bytes;
 pub mod checked;
+pub mod dataset;
 pub mod endian;
 pub mod gstring;
+pub mod hash;
 pub mod list;
 pub mod mem;
 pub mod ptr_array;
+pub mod quark;
 pub mod queue;
 pub mod refcount;
 pub mod strfuncs;
+pub mod tree;
 
 pub use array::{ByteArray, GArray};
 pub use atomic::{AtomicInt, AtomicPointer, AtomicUInt};
 pub use bytes::Bytes;
 pub use checked::{checked_add_size, checked_add_u32, checked_mul_size, checked_mul_u32};
+pub use dataset::{
+    datalist_clear, datalist_foreach, datalist_id_get_data, datalist_id_remove_no_notify,
+    datalist_id_set_data, datalist_id_set_data_full, datalist_init, DataList,
+};
 pub use endian::{
     g_htonl, g_htons, g_ntohl, g_ntohs, swap_u16_le_be, swap_u32_le_be, swap_u64_le_be,
 };
 pub use gstring::GString;
+pub use hash::{
+    direct_equal, direct_hash, double_equal, double_hash, int64_equal, int64_hash, int_equal,
+    int_hash, str_equal, str_hash, HashTable, HashTableIter,
+};
 pub use list::{CompareFn, GList, GSList, List, SList};
 pub use mem::{
     aligned_alloc, aligned_alloc0, clear, clear_with, free, malloc, malloc0, malloc0_n, malloc_n,
@@ -35,12 +46,17 @@ pub use mem::{
     try_malloc0_n, try_malloc_n, try_realloc, try_realloc_n, AlignedBuffer, MEM_ALIGN,
 };
 pub use ptr_array::{GPointer, PtrArray, PtrCompareFunc};
+pub use quark::{
+    intern_static_string, intern_string, quark_from_static_string, quark_from_string,
+    quark_to_string, quark_try_string, Quark,
+};
 pub use queue::GQueue;
 pub use refcount::{AtomicRefCount, RefCount};
 pub use strfuncs::{
     ascii_strcasecmp, str_has_prefix, str_has_suffix, strcasecmp, strchomp, strchug, strcmp,
     strconcat, strdup, strjoin, strjoinv, strlen, strndup, strstrip,
 };
+pub use tree::{CompareDataFn, GTreeNode, TraverseFn, TraverseNodeFn, Tree};
 
 /// Alias matching GLib's `gboolean`: `true` or `false`.
 pub type Bool = bool;
